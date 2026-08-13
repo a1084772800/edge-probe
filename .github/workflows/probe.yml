@@ -1,0 +1,100 @@
+name: probe
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      simulate:
+        description: "fail = force alert path (test only)"
+        required: false
+        default: ''
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: probe and alert
+        env:
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+          ALERT_CHAT_ID: ${{ secrets.ALERT_CHAT_ID }}
+          GH_TOKEN: ${{ github.token }}
+          TARGET: https://api.chuchuran.com/health
+          SIMULATE: ${{ inputs.simulate }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -u
+          send_feishu() {
+            tok=$(curl -sm 10 -X POST https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal \
+              -H 'Content-Type: application/json' \
+              -d "{\"app_id\":\"$FEISHU_APP_ID\",\"app_secret\":\"$FEISHU_APP_SECRET\"}" | jq -r '.tenant_access_token // empty')
+            if [ -z "$tok" ]; then echo "::error::feishu token failed"; return 1; fi
+            body=$(jq -n --arg cid "$ALERT_CHAT_ID" --arg txt "$1" \
+              '{receive_id:$cid, msg_type:"text", content:({text:$txt}|tostring)}')
+            resp=$(curl -sm 10 -X POST "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id" \
+              -H "Authorization: Bearer $tok" -H 'Content-Type: application/json' -d "$body")
+            echo "feishu resp: $(echo "$resp" | jq -c '{code, msg}')"
+          }
+
+          # ── 探测：3 次尝试，间隔 20s ──
+          up=0
+          if [ "$SIMULATE" = "fail" ]; then
+            echo "SIMULATE=fail：跳过真实探测，走告警路径"
+          else
+            for i in 1 2 3; do
+              code=$(curl -sm 15 -o /dev/null -w '%{http_code}' "$TARGET" || echo 000)
+              echo "attempt $i: HTTP $code"
+              if [ "$code" = "200" ]; then up=1; break; fi
+              [ "$i" -lt 3 ] && sleep 20
+            done
+          fi
+
+          # ── 状态机 = 本 workflow 的 run 历史（无外部存储）──
+          runs=$(gh api "repos/$REPO/actions/workflows/probe.yml/runs?status=completed&per_page=15" \
+            --jq '[.workflow_runs[].conclusion]' 2>/dev/null || echo '[]')
+          prev=$(echo "$runs" | jq -r '.[0] // "none"')
+          streak=$(echo "$runs" | jq '[.[]] | index("success") // length')
+          ts=$(TZ=Asia/Shanghai date '+%m-%d %H:%M')
+          echo "prev=$prev streak=$streak up=$up"
+
+          if [ "$up" = "0" ]; then
+            if [ "$prev" != "failure" ]; then
+              send_feishu "⚠️ 云端探针：主机公网口连测 3 次不通（$ts）——主机可能死机/断电/断网/隧道挂了。请查看机器；恢复后我自动报。"
+            elif [ $(( (streak + 1) % 12 )) -eq 0 ]; then
+              send_feishu "⚠️ 云端探针：主机公网口仍不通，已持续约 $(( (streak + 1) * 5 / 60 )) 小时（$ts）。"
+            else
+              echo "持续宕机第 $((streak + 1)) 轮，静默"
+            fi
+            exit 1
+          else
+            if [ "$prev" = "failure" ]; then
+              send_feishu "✅ 云端探针：主机公网口已恢复（$ts）。"
+            else
+              echo "UP，静默"
+            fi
+          fi
+
+  keepalive:
+    # 公开仓的 scheduled workflow 60 天无 commit 会被 GitHub 自动停用；每月空 commit 保活
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: monthly empty commit
+        run: |
+          # 只在每月 1 号 00:0x 的那一轮真正提交，其余轮次直接跳过
+          if [ "$(TZ=Asia/Shanghai date '+%d%H')" != "0100" ]; then
+            echo "非保活时点，跳过"; exit 0
+          fi
+          git config user.name 'probe-bot'
+          git config user.email 'probe-bot@users.noreply.github.com'
+          git commit --allow-empty -m "keepalive $(date '+%Y-%m')"
+          git push
