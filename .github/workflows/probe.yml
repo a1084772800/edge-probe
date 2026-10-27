@@ -88,13 +88,16 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
-      - name: monthly empty commit
+      - name: keepalive empty commit
         run: |
-          # 只在每月 1 号 00:0x 的那一轮真正提交，其余轮次直接跳过
-          if [ "$(TZ=Asia/Shanghai date '+%d%H')" != "0100" ]; then
-            echo "非保活时点，跳过"; exit 0
+          # 2026-10-27：原来只在「上海时间每月 1 号 00 点那一轮」提交，但 GitHub 对这个 */5 实际约 2 小时才跑一轮，
+          # 从没撞上那个钟点，10-13 被按「60 天无提交」停用、停了 15 天没人知道。
+          # 改成：HEAD 超过 25 天就提交——一个月里任意一轮落进来都能续命，不靠 GitHub 准点。
+          age=$(( $(date +%s) - $(git log -1 --format=%ct) ))
+          if [ "$age" -lt $((25 * 86400)) ]; then
+            echo "HEAD 是 $((age / 86400)) 天前，未到 25 天保活线，跳过"; exit 0
           fi
           git config user.name 'probe-bot'
           git config user.email 'probe-bot@users.noreply.github.com'
-          git commit --allow-empty -m "keepalive $(date '+%Y-%m')"
+          git commit --allow-empty -m "keepalive $(date '+%Y-%m-%d')"
           git push
