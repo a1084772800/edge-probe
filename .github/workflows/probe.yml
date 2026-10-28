@@ -24,7 +24,8 @@ jobs:
           FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
           ALERT_CHAT_ID: ${{ secrets.ALERT_CHAT_ID }}
           GH_TOKEN: ${{ github.token }}
-          TARGET: https://api.chuchuran.com/health
+          # 1028 全面审查 ops-2：原来只探 api.chuchuran.com，平台站点 youtwice.ai 自己出事（证书、解析、站点状态）没人知道
+          TARGETS: https://api.chuchuran.com/health https://youtwice.ai/health
           SIMULATE: ${{ inputs.simulate }}
           REPO: ${{ github.repository }}
         run: |
@@ -42,15 +43,19 @@ jobs:
           }
 
           # ── 探测：3 次尝试，间隔 20s ──
-          up=0
+          up=1; down=""
           if [ "$SIMULATE" = "fail" ]; then
-            echo "SIMULATE=fail：跳过真实探测，走告警路径"
+            echo "SIMULATE=fail：跳过真实探测，走告警路径"; up=0; down="（模拟）"
           else
-            for i in 1 2 3; do
-              code=$(curl -sm 15 -o /dev/null -w '%{http_code}' "$TARGET" || echo 000)
-              echo "attempt $i: HTTP $code"
-              if [ "$code" = "200" ]; then up=1; break; fi
-              [ "$i" -lt 3 ] && sleep 20
+            for t in $TARGETS; do
+              ok=0
+              for i in 1 2 3; do
+                code=$(curl -sm 15 -o /dev/null -w '%{http_code}' "$t" || echo 000)
+                echo "$t attempt $i: HTTP $code"
+                if [ "$code" = "200" ]; then ok=1; break; fi
+                [ "$i" -lt 3 ] && sleep 20
+              done
+              if [ "$ok" = "0" ]; then up=0; down="$down ${t#https://}"; fi
             done
           fi
 
@@ -64,9 +69,9 @@ jobs:
 
           if [ "$up" = "0" ]; then
             if [ "$prev" != "failure" ]; then
-              send_feishu "⚠️ 云端探针：主机公网口连测 3 次不通（$ts）——主机可能死机/断电/断网/隧道挂了。请查看机器；恢复后我自动报。"
+              send_feishu "⚠️ 云端探针：公网口连测 3 次不通：$down（$ts）——主机可能死机/断电/断网/隧道挂了，或站点自己出了问题。请查看；恢复后我自动报。"
             elif [ $(( (streak + 1) % 12 )) -eq 0 ]; then
-              send_feishu "⚠️ 云端探针：主机公网口仍不通，已持续约 $(( (streak + 1) * 5 / 60 )) 小时（$ts）。"
+              send_feishu "⚠️ 云端探针：公网口仍不通：$down，已连续 $((streak + 1)) 轮（$ts）。"
             else
               echo "持续宕机第 $((streak + 1)) 轮，静默"
             fi
